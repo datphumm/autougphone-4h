@@ -1,0 +1,1062 @@
+# -*- coding: utf-8 -*-
+import os, zipfile, tempfile, json, sys, time, re, queue, threading, concurrent.futures, shutil, hashlib, traceback
+import tkinter as tk
+from tkinter import ttk, messagebox, scrolledtext, filedialog, simpledialog
+
+import requests
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service as ChromeService
+from webdriver_manager.chrome import ChromeDriverManager
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import TimeoutException, WebDriverException
+
+# ================== CẤU HÌNH MẶC ĐỊNH ==================
+UG_REGISTER_URL = "https://www.ugphone.com/toc-portal/#/login"
+CHECK_IP_URL    = "https://ipx.ac/"
+
+EMAIL_TYPE_DELAY = 0.06
+PASS_TYPE_DELAY  = 0.055
+POST_CLICK_PAUSE = 0.5
+
+PROXY_RESET_COOLDOWN = 60
+PROXY_POST_RESET_BUFFER = 3  # giây
+# ============================================================================
+
+UA_POOL = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4_0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36 Edg/123.0.0.0",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+]
+def pick_user_agent(email: str, idx: int) -> str:
+    h = int(hashlib.sha256((email + str(idx)).encode()).hexdigest(), 16)
+    return UA_POOL[h % len(UA_POOL)]
+
+# ================== KHÓA THEO CỔNG PROXY ==================
+PROXY_LOCKS = {}
+PROXY_LOCKS_LOCK = threading.Lock()
+def _proxy_key(proxy_conf: dict) -> str:
+    if not proxy_conf: return "NO_PROXY"
+    scheme = proxy_conf.get("scheme", "http")
+    host   = proxy_conf.get("host", "")
+    port   = proxy_conf.get("port", 0)
+    user   = proxy_conf.get("user", "")
+    return f"{scheme}://{user}@{host}:{port}"
+def acquire_proxy_lock(proxy_conf: dict):
+    key = _proxy_key(proxy_conf)
+    with PROXY_LOCKS_LOCK:
+        lock = PROXY_LOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            PROXY_LOCKS[key] = lock
+    lock.acquire()
+    return key, lock
+def release_proxy_lock(key: str):
+    with PROXY_LOCKS_LOCK:
+        lock = PROXY_LOCKS.get(key)
+    if lock and lock.locked():
+        lock.release()
+
+# ================== PROXY EXTENSION (nếu cần auth) ==================
+def create_proxy_auth_extension_mv3(host, port, user, pwd, scheme="http"):
+    manifest = {
+        "name": "ProxyAuth MV3 (temp)",
+        "version": "1.0.0",
+        "manifest_version": 3,
+        "permissions": ["proxy", "storage", "webRequest", "webRequestBlocking"],
+        "host_permissions": ["<all_urls>"],
+        "background": {"service_worker": "sw.js"},
+        "minimum_chrome_version": "88.0.0"
+    }
+    sw_js = f"""
+const config = {{
+  mode: "fixed_servers",
+  rules: {{
+    singleProxy: {{ scheme: "{scheme}", host: "{host}", port: {int(port)} }},
+    bypassList: ["localhost","127.0.0.1"]
+  }}
+}};
+chrome.proxy.settings.set({{ value: config, scope: "regular" }}, () => {{}});
+function onAuth(details) {{
+  return {{ authCredentials: {{ username: "{user}", password: "{pwd}" }} }};
+}}
+chrome.webRequest.onAuthRequired.addListener(onAuth, {{ urls: ["<all_urls>"] }}, ["blocking"]);
+"""
+    tmpdir = tempfile.mkdtemp(prefix="proxy_mv3_")
+    mf = os.path.join(tmpdir, "manifest.json")
+    sw = os.path.join(tmpdir, "sw.js")
+    with open(mf, "w", encoding="utf-8") as f:
+        json.dump(manifest, f, ensure_ascii=False, indent=2)
+    with open(sw, "w", encoding="utf-8") as f:
+        f.write(sw_js)
+    zip_path = os.path.join(tmpdir, "proxy_auth_mv3.zip")
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
+        z.write(mf, "manifest.json"); z.write(sw, "sw.js")
+    return zip_path, tmpdir
+
+# ================== DRIVER ==================
+from selenium.webdriver.common.keys import Keys
+def build_driver(use_proxy: bool, proxy_conf: dict, win_w: int, win_h: int,
+                 pos_x: int = 0, pos_y: int = 0,
+                 user_agent: str = None,
+                 user_data_dir: str = None,
+                 headless: bool = False):
+    chrome_opts = Options()
+    if headless:
+        chrome_opts.add_argument("--headless=new")
+        chrome_opts.add_argument("--window-size=1920,1080")
+    chrome_opts.add_argument("--no-first-run")
+    chrome_opts.add_argument("--no-default-browser-check")
+    chrome_opts.add_argument("--disable-background-networking")
+    chrome_opts.add_argument("--disable-dev-shm-usage")
+    chrome_opts.add_argument("--disable-gpu")
+    chrome_opts.add_argument("--force-webrtc-ip-handling-policy=disable_non_proxied_udp")
+    chrome_opts.add_argument("--no-sandbox")
+    chrome_opts.add_argument("--disable-browser-side-navigation")
+    chrome_opts.add_argument("--log-level=3")
+    chrome_opts.add_argument("--disable-quic")
+    chrome_opts.add_argument("--disable-http2")
+    chrome_opts.add_argument("--disable-features=OptimizationHints,NetworkServiceInProcess")
+    chrome_opts.add_argument("--enable-features=NetworkService")
+
+    chrome_opts.add_experimental_option("detach", False)
+    chrome_opts.add_experimental_option("excludeSwitches", ["enable-automation"])
+    chrome_opts.add_experimental_option("useAutomationExtension", False)
+    if not headless:
+        chrome_opts.add_argument(f"--window-size={int(win_w)},{int(win_h)}")
+        chrome_opts.add_argument(f"--window-position={int(pos_x)},{int(pos_y)}")
+    chrome_opts.page_load_strategy = "eager"
+
+    if user_data_dir:
+        chrome_opts.add_argument(f"--user-data-dir={user_data_dir}")
+    chrome_opts.add_argument("--disk-cache-size=1")
+    chrome_opts.add_argument("--media-cache-size=1")
+    if user_agent:
+        chrome_opts.add_argument(f"--user-agent={user_agent}")
+    if use_proxy and proxy_conf:
+        scheme = proxy_conf.get("scheme","http")
+        host   = proxy_conf.get("host","")
+        port   = int(proxy_conf.get("port",0))
+        user   = proxy_conf.get("user","")
+        pwd    = proxy_conf.get("pass","")
+        if user and pwd:
+            ext_zip, _ = create_proxy_auth_extension_mv3(host, port, user, pwd, scheme)
+            chrome_opts.add_extension(ext_zip)
+        else:
+            chrome_opts.add_argument(f"--proxy-server={scheme}://{host}:{port}")
+
+    service = ChromeService(ChromeDriverManager().install())
+    driver = webdriver.Chrome(service=service, options=chrome_opts)
+    try:
+        driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
+            "source": "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});"
+        })
+    except Exception:
+        pass
+    return driver
+
+# ========= Helpers =========
+def slow_type(element, text, delay=0.25):
+    for ch in text:
+        element.send_keys(ch); time.sleep(delay)
+
+def scroll_into_view(driver, el):
+    driver.execute_script("arguments[0].scrollIntoView({behavior:'smooth',block:'center'});", el); time.sleep(0.2)
+
+def safe_click(driver, el):
+    try:
+        scroll_into_view(driver, el); el.click(); time.sleep(POST_CLICK_PAUSE); return True
+    except Exception:
+        try:
+            driver.execute_script("arguments[0].click();", el); time.sleep(POST_CLICK_PAUSE); return True
+        except Exception:
+            return False
+
+def parse_email_pass(line: str):
+    if '|' not in line: raise ValueError("Sai định dạng. Dùng 'email|pass'")
+    email, pwd = line.split('|', 1); email=email.strip(); pwd=pwd.strip()
+    if not email or not pwd: raise ValueError("Thiếu email hoặc mật khẩu.")
+    return email, pwd
+
+def parse_proxy_string(proxy_line: str):
+    parts = proxy_line.strip().split(':')
+    if len(parts) == 4:
+        host, port, user, pwd = parts
+        return {"host": host, "port": int(port), "user": user, "pass": pwd, "scheme": "http"}
+    elif len(parts) == 2:
+        host, port = parts
+        return {"host": host, "port": int(port), "user": "", "pass": "", "scheme": "http"}
+    else:
+        raise ValueError(f"Định dạng proxy không hợp lệ: '{proxy_line}'. Dùng 'host:port:user:pass' hoặc 'host:port'.")
+
+def first_visible(driver, by, value, timeout=25):
+    wait = WebDriverWait(driver, timeout)
+    wait.until(EC.presence_of_all_elements_located((by, value)))
+    for el in driver.find_elements(by, value):
+        try:
+            if el.is_displayed() and el.is_enabled(): return el
+        except Exception:
+            continue
+    return wait.until(EC.visibility_of_element_located((by, value)))
+
+def current_url_safe(driver) -> str:
+    try:
+        return driver.current_url or ""
+    except Exception:
+        return ""
+
+# ========= Robust wrappers =========
+TRY_RESET_ERRORS = (WebDriverException,)
+def _looks_like_conn_reset(e: Exception) -> bool:
+    s = str(e)
+    return ("ConnectionResetError(10054" in s) or ("10054" in s) or ("ProtocolError" in s) or ("Failed to check if window was closed" in s)
+def robust_call(call_fn, *, attempts=3, sleep_sec=1.5, log_fn=print, what="driver call"):
+    first_trace_dumped = False
+    for i in range(1, attempts + 1):
+        try:
+            res = call_fn()
+            return True, res
+        except TRY_RESET_ERRORS as e:
+            if _looks_like_conn_reset(e):
+                if not first_trace_dumped:
+                    log_fn(f"[ROBUST] {what}: kết nối reset. Thử lại {i}/{attempts}.\n" + traceback.format_exc())
+                    first_trace_dumped = True
+                else:
+                    log_fn(f"[ROBUST] {what}: reset, retry {i}/{attempts}…")
+                time.sleep(sleep_sec)
+                continue
+            return False, e
+        except Exception as e:
+            return False, e
+    return False, RuntimeError(f"{what} thất bại sau {attempts} lần thử")
+
+# ================== LocalStorage VERIFY + EXPORT ==================
+def get_localstorage_json(driver) -> dict:
+    try:
+        raw = driver.execute_script("return JSON.stringify(window.localStorage);")
+        if not raw:
+            return {}
+        data = json.loads(raw)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+def has_ugphone_session(ls: dict) -> bool:
+    tok = (ls.get("UGPHONE-Token") or "").strip()
+    has_id = bool((ls.get("UGPHONE-ID") or "").strip())
+    has_mqtt = bool((ls.get("UGPHONE-MQTT") or "").strip())
+    if tok and not tok.lower().startswith("visitor-"):
+        return True
+    if tok and (has_id or has_mqtt):
+        return True
+    return False
+
+def sanitize_filename(s: str) -> str:
+    s = re.sub(r'[^a-zA-Z0-9._-]+', '_', s)
+    return s.strip('_') or "account"
+
+def export_localstorage_to_file(ls: dict, export_dir: str, email: str, log_fn=print):
+    try:
+        if not export_dir:
+            log_fn("[EXPORT] Bỏ qua: chưa chọn thư mục lưu.")
+            return
+        os.makedirs(export_dir, exist_ok=True)
+        base = email.replace('@', '_at_').replace(':', '_')
+        fname = sanitize_filename(base) + ".txt"
+        path = os.path.join(export_dir, fname)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(ls, f, ensure_ascii=False, indent=2, sort_keys=True)
+        log_fn(f"[EXPORT] Đã lưu localStorage → {path}")
+    except Exception as e:
+        log_fn(f"[EXPORT] Lỗi lưu localStorage: {e}")
+
+# ================== Reset IP (Generic API) ==================
+def reset_ip_via_api(reset_url, log_fn=print):
+    if not reset_url:
+        log_fn("[RESET] Không có URL reset -> bỏ qua.")
+        return False, None, 0
+    try:
+        log_fn(f"[RESET] Đang gọi API: {reset_url}")
+        r = requests.get(reset_url, timeout=20)
+        log_fn(f"[RESET] API Response (Code: {r.status_code}): {r.text[:500]}")
+
+        if not r.ok:
+            log_fn(f"[RESET] ❌ Thất bại (HTTP Status: {r.status_code})")
+            try:
+                data = r.json()
+                if str(data.get("code")) == "499":
+                    remaining = int(data.get("data", {}).get("remaining_time", 0))
+                    log_fn(f"[RESET] ⏳ API (mproxy-style) yêu cầu chờ {remaining}s.")
+                    return False, None, max(remaining, 1)
+            except Exception:
+                pass
+            return False, None, 0
+
+        response_text_lower = r.text.strip().lower()
+        if "ok" in response_text_lower or "success" in response_text_lower or "thành công" in response_text_lower:
+            log_fn(f"[RESET] ✅ Thành công (API response text chứa từ khóa thành công)")
+            return True, {"response": r.text.strip()}, 0
+
+        try:
+            data = r.json()
+            status_val = str(data.get("status", "")).lower()
+            success_val = data.get("success")
+            code_val = str(data.get("code", "")).lower()
+            message_val = str(data.get("message", "")).lower()
+
+            is_success = (
+                status_val in ["ok", "success", "true", "1", "200"] or
+                success_val is True or
+                code_val in ["ok", "success", "true", "1", "200"] or
+                "success" in message_val or
+                "thành công" in message_val
+            )
+
+            if is_success:
+                log_fn(f"[RESET] ✅ Thành công (API JSON response hợp lệ).")
+                return True, data, 0
+            else:
+                if code_val == "499":
+                    remaining = int(data.get("data", {}).get("remaining_time", 0))
+                    log_fn(f"[RESET] ⏳ API (mproxy-style) yêu cầu chờ {remaining}s.")
+                    return False, None, max(remaining, 1)
+                
+                log_fn(f"[RESET] ❌ Thất bại (API trả về JSON không báo thành công)")
+                return False, None, 0
+        except json.JSONDecodeError:
+            log_fn(f"[RESET] ✅ Thành công (API trả về HTTP 200, nội dung không phải JSON, giả định là OK).")
+            return True, {"response": r.text.strip()}, 0
+
+    except requests.exceptions.RequestException as e:
+        log_fn(f"[RESET] ❌ Lỗi kết nối khi gọi API: {e}")
+        return False, None, 0
+    except Exception as e:
+        log_fn(f"[RESET] ❌ Lỗi không xác định khi reset IP: {e}")
+        return False, None, 0
+
+def reset_ip_until_success(reset_url, min_delay, log_fn=print, max_tries=9999):
+    tries = 0
+    while tries < max_tries:
+        tries += 1
+        ok, info, wait_seconds_api = reset_ip_via_api(reset_url, log_fn)
+        if ok:
+            log_fn(f"[RESET] OK sau {tries} lần thử."); return True, info
+        final_wait = max(wait_seconds_api, min_delay)
+        if final_wait > 0:
+            log_fn(f"[RESET] Chờ {final_wait}s trước khi thử lại...")
+            time.sleep(final_wait)
+        else:
+            time.sleep(3)
+    return False, None
+
+def ensure_proxy_reset_before_attempt(reset_url: str, last_reset_ts: list, min_delay: int, log_fn=print, post_reset_buffer: int = PROXY_POST_RESET_BUFFER) -> bool:
+    if not reset_url:
+        return True
+    now = time.time()
+    last_reset = last_reset_ts[0] or 0
+    elapsed = now - last_reset
+    if elapsed < PROXY_RESET_COOLDOWN:
+        wait_duration = PROXY_RESET_COOLDOWN - elapsed
+        if wait_duration > 0:
+            log_fn(f"[RESET] Đang đợi cooldown {int(wait_duration)}s...")
+            time.sleep(wait_duration)
+    ok, _ = reset_ip_until_success(reset_url, min_delay, log_fn)
+    if not ok:
+        log_fn("[RESET] ⛔ Reset IP thất bại, không mở trình duyệt.")
+        return False
+    last_reset_ts[0] = time.time()
+    log_fn(f"[RESET] ✅ Reset IP thành công. Chờ đệm {post_reset_buffer}s...")
+    time.sleep(max(0, int(post_reset_buffer)))
+    return True
+
+# ================== Click Google TRÊN TRANG ĐĂNG KÝ ==================
+def click_register_google_button(driver: webdriver.Chrome, timeout=25):
+    wait = WebDriverWait(driver, timeout)
+    xpaths = [
+        "//span[contains(normalize-space(),'Tiếp tục sử dụng dịch vụ bằng Google')]/ancestor::button",
+        "//button[.//span[contains(normalize-space(),'Tiếp tục sử dụng dịch vụ bằng Google')]]",
+        "//span[contains(@class,'nsm7Bb-HzV7m-LgbsSe-BPrWId') and contains(normalize-space(),'Google')]/ancestor::*[self::button or self::div][1]"
+    ]
+    for xp in xpaths:
+        try:
+            btn = wait.until(EC.element_to_be_clickable((By.XPATH, xp)))
+            if safe_click(driver, btn): return True
+        except (TimeoutException, WebDriverException):
+            pass
+    try:
+        iframe = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "iframe[src*='accounts.google.com/gsi/button'], iframe[title*='Google']")))
+        driver.switch_to.frame(iframe)
+        try:
+            btn = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "div[role='button'], button, .nsm7Bb-HzV7m-LgbsSe")))
+            safe_click(driver, btn); return True
+        finally:
+            try: driver.switch_to.default_content()
+            except Exception: pass
+    except (TimeoutException, WebDriverException):
+        pass
+    css_list = ["button.google-btn", "#google-btn", "button .btn-content", "button.van-button--block"]
+    for css in css_list:
+        try:
+            btn = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, css)))
+            if safe_click(driver, btn): return True
+        except (TimeoutException, WebDriverException):
+            pass
+    return False
+
+# ================== Google flow ==================
+def login_google_flow(driver: webdriver.Chrome, email: str, password: str):
+    wait = WebDriverWait(driver, 50)
+    try: driver.switch_to.default_content()
+    except Exception: pass
+    time.sleep(1.0)
+    base = driver.current_window_handle
+    for h in driver.window_handles:
+        if h != base:
+            driver.switch_to.window(h); break
+    try:
+        wait.until(lambda d: ("accounts.google." in (d.current_url or "")) or ("signin" in (d.current_url or "")))
+    except TimeoutException:
+        return ("FedCM/popup: cần thao tác tay.", False)
+
+    # email
+    try:
+        email_input = first_visible(driver, By.ID, "identifierId", timeout=25)
+        scroll_into_view(driver, email_input)
+        try: email_input.click()
+        except Exception: driver.execute_script("arguments[0].focus();", email_input)
+        email_input.clear()
+        slow_type(email_input, email, delay=EMAIL_TYPE_DELAY)
+        time.sleep(0.2)
+        next_btn = first_visible(driver, By.ID, "identifierNext", timeout=15)
+        safe_click(driver, next_btn)
+    except Exception:
+        pass
+
+    # password
+    try:
+        wait.until(EC.any_of(
+            EC.presence_of_element_located((By.NAME, "Passwd")),
+            EC.presence_of_element_located((By.CSS_SELECTOR, "input[name='Passwd']"))
+        ))
+        time.sleep(0.2)
+        pwd_input = first_visible(driver, By.CSS_SELECTOR, "input[name='Passwd']", timeout=25)
+        scroll_into_view(driver, pwd_input)
+        try: pwd_input.click()
+        except Exception: driver.execute_script("arguments[0].focus();", pwd_input)
+        pwd_input.clear()
+        slow_type(pwd_input, password, delay=PASS_TYPE_DELAY)
+    except Exception:
+        pass
+
+    try:
+        next_btn2 = first_visible(driver, By.ID, "passwordNext", timeout=20)
+        safe_click(driver, next_btn2)
+    except Exception:
+        pass
+
+    # confirm/continue nếu có
+    for xp in [
+        (By.CSS_SELECTOR, "#confirm, input#confirm"),
+        (By.XPATH, "//span[normalize-space()='Continue' or normalize-space()='Tiếp tục' or contains(.,'Continue')]")
+    ]:
+        try:
+            btn = WebDriverWait(driver, 12).until(EC.element_to_be_clickable(xp))
+            safe_click(driver, btn)
+        except Exception:
+            pass
+
+    return ("Đã xử lý đăng nhập Google.", True)
+
+# ================== Worker: MỖI TÀI KHOẢN CHỈ CHẠY 1 LẦN ==================
+def run_flow_single(ep_line: str, proxy_line: str, open_ip_check: bool,
+                    win_w: int, win_h: int, pos_x: int, pos_y: int, idx: int,
+                    reset_url: str, min_reset_delay: int,
+                    log_fn, 
+                    headless: bool, stop_event: threading.Event,
+                    export_ls_enabled: bool, export_dir: str,
+                    ui_update_q: queue.Queue, item_id: str,
+                    active_drivers_dict: dict, driver_lock: threading.Lock):
+    
+    try:
+        email, password = parse_email_pass(ep_line)
+    except Exception as e:
+        log_fn(f"[INPUT] '{ep_line}': Sai 'email|pass'. BỎ. Lỗi: {e}")
+        ui_update_q.put(("status", item_id, "Lỗi Input"))
+        return
+
+    proxy_conf = {}
+    proxy_key = None
+    proxy_lock = None
+    driver = None 
+    user_data_dir = tempfile.mkdtemp(prefix=f"profile_{re.sub(r'[^a-zA-Z0-9]', '_', email)}_")
+
+    if bool(proxy_line):
+        try:
+            proxy_conf = parse_proxy_string(proxy_line)
+        except ValueError as e:
+            log_fn(f"[{email}] ❌ Proxy không hợp lệ: {e}.")
+            ui_update_q.put(("status", item_id, "Lỗi Proxy"))
+            shutil.rmtree(user_data_dir, ignore_errors=True)
+            return
+
+    if stop_event.is_set(): 
+        ui_update_q.put(("status", item_id, "Đã dừng"))
+        shutil.rmtree(user_data_dir, ignore_errors=True)
+        return
+
+    if proxy_conf:
+        proxy_key, proxy_lock = acquire_proxy_lock(proxy_conf)
+        log_fn(f"[{email}] 🔐 Giữ cổng proxy: {proxy_key}")
+    
+    try:
+        # Build driver and perform actions
+        try:
+            last_reset_ts = [None]
+            if reset_url:
+                if stop_event.is_set(): return
+                if not ensure_proxy_reset_before_attempt(reset_url, last_reset_ts, min_reset_delay, log_fn):
+                    raise RuntimeError("Reset IP thất bại.")
+
+            if stop_event.is_set(): return
+            log_fn(f"[{email}] 🔄 Bắt đầu đăng nhập...")
+            ua = pick_user_agent(email, idx)
+            
+            driver = build_driver(bool(proxy_conf), proxy_conf, win_w, win_h,
+                                  pos_x=pos_x, pos_y=pos_y,
+                                  user_agent=ua, user_data_dir=user_data_dir,
+                                  headless=headless)
+            
+            with driver_lock:
+                if stop_event.is_set(): raise RuntimeError("Dừng bởi người dùng trước khi gán driver")
+                active_drivers_dict[item_id] = driver
+
+            if open_ip_check:
+                if stop_event.is_set(): return
+                driver.get(CHECK_IP_URL)
+                try: driver.execute_script(f"document.title = 'IP Check - {email}';")
+                except: pass
+                time.sleep(1.0)
+            
+            if stop_event.is_set(): return
+            driver.get(UG_REGISTER_URL)
+            try: driver.execute_script(f"document.title = 'Login - {email}';")
+            except: pass
+            
+            if stop_event.is_set(): return
+            if not click_register_google_button(driver, timeout=30):
+                raise RuntimeError("Không click được nút Google")
+            
+            if stop_event.is_set(): return
+            login_google_flow(driver, email, password)
+
+            if stop_event.is_set(): return
+            log_fn(f"[{email}] ✅ Đăng nhập thành công. Giữ trình duyệt mở.")
+            ui_update_q.put(("status", item_id, "Đang mở"))
+            ui_update_q.put(("action", item_id, "Đóng"))
+
+            if export_ls_enabled:
+                ls = get_localstorage_json(driver)
+                if has_ugphone_session(ls):
+                    export_localstorage_to_file(ls, export_dir, email, log_fn)
+                else:
+                    log_fn(f"[{email}] [EXPORT] Bỏ qua, không tìm thấy session.")
+            
+            # Wait for browser to be closed
+            while not stop_event.is_set():
+                try:
+                    if not driver.window_handles:
+                        log_fn(f"[{email}] Trình duyệt đã được đóng thủ công.")
+                        ui_update_q.put(("status", item_id, "Hoàn tất"))
+                        driver = None # Prevent finally block from quitting again
+                        return
+                except WebDriverException:
+                    log_fn(f"[{email}] Mất kết nối tới trình duyệt (đã đóng).")
+                    if stop_event.is_set():
+                        ui_update_q.put(("status", item_id, "Đã đóng"))
+                    else:
+                        ui_update_q.put(("status", item_id, "Lỗi trình duyệt"))
+                    driver = None # Prevent finally block from quitting again
+                    return
+                time.sleep(1)
+
+            # If we reach here, stop_event was set
+            log_fn(f"[{email}] Nhận lệnh dừng, luồng kết thúc.")
+            ui_update_q.put(("status", item_id, "Đã đóng"))
+
+        except Exception as e:
+            if not stop_event.is_set():
+                log_fn(f"[{email}] ❌ Lỗi trong flow: {e}")
+                ui_update_q.put(("status", item_id, "Lỗi"))
+            else:
+                log_fn(f"[{email}] Đã dừng trong lúc chạy.")
+                ui_update_q.put(("status", item_id, "Đã dừng"))
+        finally:
+            # This block cleans up the driver if it still exists
+            with driver_lock:
+                active_drivers_dict.pop(item_id, None)
+            if driver:
+                try: driver.quit()
+                except: pass
+
+    finally:
+        # This block cleans up non-driver resources
+        if proxy_conf and proxy_lock:
+            release_proxy_lock(proxy_key)
+        shutil.rmtree(user_data_dir, ignore_errors=True)
+
+
+# =========================== UI (Tkinter) ===========================
+class App(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("UGPhone Register — One-shot Login")
+        self.geometry("1150x880")
+
+        self.account_data = {}
+        self.running_tasks = {}
+        self.active_drivers = {}
+        self.driver_lock = threading.Lock()
+        self.stop_event_all = None
+        
+        self.log_q = queue.Queue()
+        self.success_log_q = queue.Queue()
+        self.ui_update_q = queue.Queue()
+
+        self._create_widgets()
+        self.ui_pump()
+
+    def _create_widgets(self):
+        main = ttk.Frame(self, padding=12)
+        main.pack(fill="both", expand=True)
+        left_col = ttk.Frame(main)
+        left_col.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
+        right_col = ttk.Frame(main)
+        right_col.grid(row=0, column=1, sticky="nsew")
+
+        self._create_account_list_widgets(left_col)
+        self._create_settings_widgets(left_col)
+        self._create_export_widgets(left_col)
+        self._create_proxy_widgets(right_col)
+        self._create_log_widgets(right_col)
+        
+        bottom_row = ttk.Frame(main)
+        bottom_row.grid(row=1, column=0, columnspan=2, sticky="nsew", pady=(10, 0))
+        self._create_control_widgets(bottom_row)
+
+        main.grid_rowconfigure(0, weight=1)
+        main.grid_columnconfigure(0, weight=1)
+        main.grid_columnconfigure(1, weight=1)
+        
+    def _create_account_list_widgets(self, parent):
+        main_account_frame = ttk.Frame(parent)
+        main_account_frame.pack(fill="both", expand=True)
+
+        input_frame = ttk.LabelFrame(main_account_frame, text="Nhập dữ liệu (email|pass)", padding=5)
+        input_frame.pack(fill="x", side="top", pady=(0, 5))
+        self.account_input_txt = scrolledtext.ScrolledText(input_frame, height=5)
+        self.account_input_txt.pack(fill="x", expand=True, side="left", padx=(0,5))
+        load_btn = ttk.Button(input_frame, text="Nạp vào\ndanh sách", command=self.populate_tree_from_input)
+        load_btn.pack(fill="y", expand=True, side="right")
+        
+        account_frame = ttk.LabelFrame(main_account_frame, text="Danh sách Tài khoản", padding=10)
+        account_frame.pack(fill="both", expand=True)
+        
+        cols = ("#", "email", "status", "action")
+        self.tree = ttk.Treeview(account_frame, columns=cols, show="headings", height=8)
+        self.tree.heading("#", text="#"); self.tree.heading("email", text="Email")
+        self.tree.heading("status", text="Trạng thái"); self.tree.heading("action", text="Hành động")
+        self.tree.column("#", width=40, anchor="center"); self.tree.column("email", width=220)
+        self.tree.column("status", width=100, anchor="center"); self.tree.column("action", width=80, anchor="center")
+
+        vsb = ttk.Scrollbar(account_frame, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=vsb.set)
+        vsb.pack(side="right", fill="y")
+        self.tree.pack(side="left", fill="both", expand=True)
+
+        account_actions_frame = ttk.Frame(parent)
+        account_actions_frame.pack(fill="x", pady=(4, 0))
+        ttk.Button(account_actions_frame, text="Nạp từ File...", command=self.load_account_file).pack(side="left")
+        ttk.Button(account_actions_frame, text="Lưu ra File...", command=self.save_account_list).pack(side="left", padx=5)
+        ttk.Button(account_actions_frame, text="Thêm dòng...", command=self.add_account_dialog).pack(side="left", padx=5)
+        self.mark_success_btn = ttk.Button(account_actions_frame, text="Chuyển thành công", command=self.mark_selected_as_successful)
+        self.mark_success_btn.pack(side="right")
+        ttk.Button(account_actions_frame, text="Xóa dòng chọn", command=self.remove_selected_account).pack(side="right", padx=5)
+        
+        self.tree.bind("<Button-1>", self.on_tree_click)
+
+    def _create_settings_widgets(self, parent):
+        settings_frame = ttk.LabelFrame(parent, text="Cài đặt", padding=10)
+        settings_frame.pack(fill="x", pady=(10,0))
+        
+        ttk.Label(settings_frame, text="Số luồng song song:").grid(row=0, column=0, sticky="w", pady=2)
+        self.threads_var = tk.StringVar(value="3")
+        ttk.Spinbox(settings_frame, from_=1, to=100, textvariable=self.threads_var, width=8).grid(row=0, column=1, sticky="w")
+
+        ttk.Label(settings_frame, text="Cỡ cửa sổ (W×H):").grid(row=1, column=0, sticky="w", pady=2)
+        win_size_frame = ttk.Frame(settings_frame)
+        win_size_frame.grid(row=1, column=1, sticky="w")
+        self.win_w_var = tk.StringVar(value="900"); self.win_h_var = tk.StringVar(value="620")
+        ttk.Entry(win_size_frame, textvariable=self.win_w_var, width=8).pack(side="left")
+        ttk.Entry(win_size_frame, textvariable=self.win_h_var, width=8).pack(side="left", padx=(6,0))
+
+        ttk.Label(settings_frame, text="Grid margin X/Y:").grid(row=2, column=0, sticky="w", pady=2)
+        margin_frame = ttk.Frame(settings_frame); margin_frame.grid(row=2, column=1, sticky="w")
+        self.margin_x_var = tk.StringVar(value="0"); self.margin_y_var = tk.StringVar(value="0")
+        ttk.Entry(margin_frame, textvariable=self.margin_x_var, width=8).pack(side="left")
+        ttk.Entry(margin_frame, textvariable=self.margin_y_var, width=8).pack(side="left", padx=(6,0))
+
+        self.ip_check_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(settings_frame, text="Mở ipx.ac trước khi đăng ký (mỗi lần thử)", variable=self.ip_check_var).grid(row=3, column=0, columnspan=2, sticky="w", pady=(6,0))
+        self.headless_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(settings_frame, text="Chạy ngầm (headless)", variable=self.headless_var).grid(row=4, column=0, columnspan=2, sticky="w", pady=(6,0))
+
+    def _create_export_widgets(self, parent):
+        export_frame = ttk.LabelFrame(parent, text="Lưu localStorage (.txt)", padding=10)
+        export_frame.pack(fill="x", pady=(10, 0))
+        self.export_ls_var = tk.BooleanVar(value=True)
+        self.export_dir_var = tk.StringVar(value=os.path.join(os.getcwd(), "localstorage_exports"))
+        ttk.Checkbutton(export_frame, text="Bật lưu localStorage nếu tìm thấy session", variable=self.export_ls_var).grid(row=0, column=0, sticky="w", columnspan=3)
+        ttk.Label(export_frame, text="Thư mục lưu:").grid(row=1, column=0, sticky="w", pady=6)
+        ttk.Entry(export_frame, textvariable=self.export_dir_var, width=45).grid(row=1, column=1, sticky="w")
+        def pick_dir():
+            d = filedialog.askdirectory()
+            if d: self.export_dir_var.set(d)
+        ttk.Button(export_frame, text="Chọn...", command=pick_dir).grid(row=1, column=2, padx=(6, 0), sticky="w")
+
+    def _create_proxy_widgets(self, parent):
+        proxy_frame = ttk.LabelFrame(parent, text="Cấu hình Proxy", padding=10); proxy_frame.pack(fill="x")
+        self.proxy_mode_var = tk.StringVar(value="none")
+        ttk.Radiobutton(proxy_frame, text="Không sử dụng Proxy", variable=self.proxy_mode_var, value="none").pack(anchor="w")
+        ttk.Radiobutton(proxy_frame, text="Dùng 1 proxy duy nhất cho tất cả", variable=self.proxy_mode_var, value="single").pack(anchor="w")
+        ttk.Radiobutton(proxy_frame, text="Dùng danh sách proxy riêng", variable=self.proxy_mode_var, value="list").pack(anchor="w")
+
+        self.single_proxy_entry_var = tk.StringVar()
+        self.single_proxy_entry = ttk.Entry(proxy_frame, textvariable=self.single_proxy_entry_var, width=60)
+        self.proxy_list_container = ttk.Frame(proxy_frame)
+        self.proxy_list_txt = scrolledtext.ScrolledText(self.proxy_list_container, width=35, height=5)
+        self.reset_list_txt = scrolledtext.ScrolledText(self.proxy_list_container, width=35, height=5)
+        self.auto_threads_var = tk.BooleanVar(value=False)
+        self.auto_threads_cb = ttk.Checkbutton(proxy_frame, text="Số luồng = số proxy (auto)", variable=self.auto_threads_var)
+        self.reset_frame = ttk.LabelFrame(parent, text="Tự động Reset IP (qua API)", padding=10)
+        self.single_reset_url_var = tk.StringVar(value="")
+        self.single_reset_url_entry = ttk.Entry(self.reset_frame, textvariable=self.single_reset_url_var, width=60)
+        self.reset_delay_var = tk.StringVar(value="10")
+        self.reset_delay_spinbox = ttk.Spinbox(self.reset_frame, from_=0, to=300, textvariable=self.reset_delay_var, width=8)
+
+        self.proxy_mode_var.trace_add("write", self.update_proxy_ui)
+        self.proxy_list_txt.insert("1.0", "host1:port1:user1:pass1\nhost2:port2:user2:pass2")
+        self.reset_list_txt.insert("1.0", "http://reset.url/1\nhttp://reset.url/2")
+        self.update_proxy_ui()
+
+    def _create_log_widgets(self, parent):
+        log_frame = ttk.LabelFrame(parent, text="Log Thao Tác", padding=10)
+        log_frame.pack(fill="both", expand=True, pady=(10,0))
+        self.log_box = scrolledtext.ScrolledText(log_frame, width=50, height=8, state="disabled")
+        self.log_box.pack(fill="both", expand=True)
+
+        success_log_frame = ttk.LabelFrame(parent, text="Tài Khoản Thành Công (đã xác nhận)", padding=10)
+        success_log_frame.pack(fill="both", expand=True, pady=(10,0))
+        self.success_log_box = scrolledtext.ScrolledText(success_log_frame, width=50, height=5, state="disabled")
+        self.success_log_box.pack(fill="both", expand=True)
+    
+    def _create_control_widgets(self, parent):
+        btns = ttk.Frame(parent)
+        btns.pack(fill="x")
+        self.start_btn = ttk.Button(btns, text="Chạy mục chưa hoàn tất", command=self.on_start)
+        self.start_btn.pack(side="left")
+        self.stop_btn  = ttk.Button(btns, text="Dừng tất cả", command=self.on_stop, state="disabled")
+        self.stop_btn.pack(side="left", padx=(10, 0))
+        ttk.Button(btns, text="Thoát", command=self.destroy).pack(side="right")
+
+        hint = ("Lưu ý:\n"
+            "- 'Chạy mục chưa hoàn tất' sẽ bỏ qua các tài khoản đã ở trạng thái 'Thành công'.\n"
+            "- Sau khi một tài khoản 'Hoàn tất', chọn nó và nhấn 'Chuyển thành công' để xác nhận.\n"
+            f"- Cooldown reset proxy là {PROXY_RESET_COOLDOWN}s + đệm {PROXY_POST_RESET_BUFFER}s.")
+        ttk.Label(parent, text=hint, foreground="#555").pack(fill="x", pady=(6,0))
+
+    def update_proxy_ui(self, *_):
+        for w in [self.single_proxy_entry, self.proxy_list_container, self.auto_threads_cb, self.reset_frame]: w.pack_forget()
+        for w in self.reset_frame.winfo_children(): w.grid_forget()
+        mode = self.proxy_mode_var.get()
+        if mode != "none":
+            self.reset_frame.pack(fill="x", pady=(10,0))
+        if mode == "single":
+            self.single_proxy_entry.pack(fill="x", pady=(6,0))
+            ttk.Label(self.reset_frame, text="Link API Reset (proxy chung):").grid(row=0, column=0, sticky="w")
+            self.single_reset_url_entry.grid(row=1, column=0, columnspan=2, sticky="ew")
+            ttk.Label(self.reset_frame, text="Giây chờ tối thiểu khi API yêu cầu chờ:").grid(row=2, column=0, sticky="w", pady=(6,0))
+            self.reset_delay_spinbox.grid(row=2, column=1, sticky="w", pady=(6,0))
+        elif mode == "list":
+            self.proxy_list_container.pack(fill="x", pady=(6,0))
+            ttk.Label(self.proxy_list_container, text="Danh sách Proxy (1 dòng / proxy)").grid(row=0, column=0, sticky="w")
+            self.proxy_list_txt.grid(row=1, column=0, sticky="nsew", padx=(0,6))
+            ttk.Label(self.proxy_list_container, text="Link Reset API (tương ứng mỗi dòng)").grid(row=0, column=1, sticky="w")
+            self.reset_list_txt.grid(row=1, column=1, sticky="nsew")
+            self.proxy_list_container.grid_columnconfigure(0, weight=1); self.proxy_list_container.grid_columnconfigure(1, weight=1)
+            self.auto_threads_cb.pack(anchor="w", pady=(6,0))
+            ttk.Label(self.reset_frame, text="Giây chờ tối thiểu khi API yêu cầu chờ:").grid(row=2, column=0, sticky="w", pady=(6,0))
+            self.reset_delay_spinbox.grid(row=2, column=1, sticky="w", pady=(6,0))
+
+    def add_account_row(self, email, password, status="Sẵn sàng"):
+        count = len(self.tree.get_children()) + 1
+        # FIX: Ensure all values are strings for Treeview
+        values_tuple = (str(count), str(email), str(status), "Chạy")
+        item_id = self.tree.insert("", "end", values=values_tuple)
+        self.account_data[item_id] = {"email": email, "pass": password}
+        self.tree.yview_moveto(1)
+
+    def add_account_dialog(self):
+        data = simpledialog.askstring("Thêm tài khoản", "Nhập email|pass:", parent=self)
+        if data and '|' in data:
+            try:
+                email, password = parse_email_pass(data)
+                self.add_account_row(email, password)
+            except ValueError as e: messagebox.showerror("Lỗi", str(e))
+
+    def remove_selected_account(self):
+        selected_items = self.tree.selection()
+        if not selected_items:
+            messagebox.showinfo("Chưa chọn", "Vui lòng chọn một hoặc nhiều dòng để xóa.")
+            return
+        if messagebox.askyesno("Xác nhận xóa", f"Bạn có chắc muốn xóa {len(selected_items)} dòng đã chọn?"):
+            for item_id in selected_items:
+                if item_id in self.account_data: del self.account_data[item_id]
+                self.stop_single_job(item_id, silent=True)
+                self.tree.delete(item_id)
+            self.renumber_tree()
+
+    def renumber_tree(self):
+        for i, item_id in enumerate(self.tree.get_children()):
+            # FIX: Ensure value is a string
+            self.tree.set(item_id, column="#", value=str(i + 1))
+            
+    def save_account_list(self):
+        if not self.account_data:
+            messagebox.showwarning("Danh sách rỗng", "Không có gì để lưu.")
+            return
+        filepath = filedialog.asksaveasfilename(defaultextension=".txt", filetypes=[("Text Files", "*.txt")], title="Lưu danh sách tài khoản")
+        if filepath:
+            try:
+                with open(filepath, "w", encoding="utf-8") as f:
+                    for item_id in self.tree.get_children():
+                        data = self.account_data.get(item_id)
+                        if data and data["email"]: f.write(f"{data['email']}|{data['pass']}\n")
+                self.log_fn(f"Đã lưu danh sách vào: {filepath}")
+            except Exception as e: messagebox.showerror("Lỗi Lưu File", f"Không thể lưu file:\n{e}")
+    
+    def populate_tree_from_input(self):
+        content = self.account_input_txt.get("1.0", "end-1c")
+        lines = content.strip().splitlines()
+        if not lines:
+            messagebox.showinfo("Thông báo", "Ô nhập liệu rỗng.")
+            return
+        if messagebox.askyesno("Xác nhận", "Thao tác này sẽ xóa danh sách hiện tại và nạp dữ liệu mới. Tiếp tục?"):
+            self.tree.delete(*self.tree.get_children())
+            self.account_data.clear()
+            for line in lines:
+                line = line.strip()
+                if '|' in line:
+                    try:
+                        email, password = parse_email_pass(line)
+                        self.add_account_row(email, password)
+                    except ValueError: self.log_fn(f"Bỏ qua dòng lỗi định dạng: {line}")
+            self.log_fn(f"Đã nạp {len(self.tree.get_children())} tài khoản vào danh sách.")
+
+    def load_account_file(self):
+        filepath = filedialog.askopenfilename(filetypes=[("Text Files", "*.txt")], title="Nạp danh sách tài khoản từ File")
+        if filepath:
+            try:
+                with open(filepath, "r", encoding="utf-8") as f: content = f.read()
+                self.account_input_txt.delete("1.0", "end")
+                self.account_input_txt.insert("1.0", content)
+                self.log_fn(f"Đã nạp dữ liệu từ file vào ô nhập liệu: {filepath}")
+                self.populate_tree_from_input()
+            except Exception as e: messagebox.showerror("Lỗi Nạp File", f"Không thể đọc file:\n{e}")
+
+    def on_tree_click(self, event):
+        if self.tree.identify_region(event.x, event.y) != "cell": return
+        item_id = self.tree.identify_row(event.y)
+        column_id = self.tree.identify_column(event.x)
+        if column_id == "#4": # Column "action"
+            current_action = self.tree.set(item_id, "action")
+            if current_action == "Chạy": self.start_single_job(item_id)
+            elif current_action == "Đóng": self.stop_single_job(item_id)
+
+    def mark_selected_as_successful(self):
+        selected_items = self.tree.selection()
+        if not selected_items:
+            messagebox.showinfo("Chưa chọn", "Vui lòng chọn một hoặc nhiều tài khoản để chuyển sang thành công.")
+            return
+        for item_id in selected_items:
+            if self.tree.exists(item_id):
+                self.tree.set(item_id, "status", "Thành công")
+                account = self.account_data.get(item_id)
+                if account: self.success_log_push(account["email"])
+
+    def ui_pump(self):
+        try:
+            while True:
+                line = self.log_q.get_nowait()
+                self.log_box.configure(state="normal"); self.log_box.insert("end", line + "\n"); self.log_box.see("end"); self.log_box.configure(state="disabled")
+        except queue.Empty: pass
+        try:
+            while True:
+                line = self.success_log_q.get_nowait()
+                self.success_log_box.configure(state="normal"); self.success_log_box.insert("end", line + "\n"); self.success_log_box.see("end"); self.success_log_box.configure(state="disabled")
+        except queue.Empty: pass
+        try:
+            while True:
+                msg_type, item_id, value = self.ui_update_q.get_nowait()
+                if self.tree.exists(item_id):
+                    if msg_type == "status":
+                        self.tree.set(item_id, "status", value)
+                        if value not in ["Đang chạy...", "Đang chờ...", "Đang mở"]:
+                            if item_id in self.running_tasks: del self.running_tasks[item_id]
+                            self.tree.set(item_id, "action", "Chạy")
+                    elif msg_type == "action": self.tree.set(item_id, "action", value)
+        except queue.Empty: pass
+        self.after(100, self.ui_pump)
+
+    def log_fn(self, msg: str): self.log_q.put(msg)
+    def success_log_push(self, msg: str): self.success_log_q.put(msg)
+
+    def _prepare_run(self):
+        try:
+            settings = {"n_threads": int(self.threads_var.get().strip()), "win_w": max(400, int(self.win_w_var.get().strip())),
+                "win_h": max(300, int(self.win_h_var.get().strip())), "margin_x": max(0, int(self.margin_x_var.get().strip())),
+                "margin_y": max(0, int(self.margin_y_var.get().strip())), "min_reset_delay": int(self.reset_delay_var.get().strip()),
+                "export_ls_enabled": bool(self.export_ls_var.get()), "export_dir": self.export_dir_var.get().strip(),
+                "proxy_mode": self.proxy_mode_var.get(), "headless": self.headless_var.get(), "ip_check": self.ip_check_var.get()}
+        except ValueError:
+            messagebox.showerror("Sai định dạng số", "Kiểm tra lại các giá trị số trong cài đặt."); return None
+        if settings["n_threads"] <= 0:
+            messagebox.showerror("Sai số luồng", "Số luồng phải lớn hơn 0."); return None
+        settings["proxy_lines"] = []; settings["reset_url_lines"] = []
+        if settings["proxy_mode"] == 'single':
+            single_proxy = self.single_proxy_entry_var.get().strip()
+            if not single_proxy: messagebox.showerror("Thiếu Proxy", "Bạn đã chọn dùng 1 proxy nhưng chưa nhập."); return None
+            settings["proxy_lines"] = [single_proxy]; settings["reset_url_lines"] = [self.single_reset_url_var.get().strip()]
+        elif settings["proxy_mode"] == 'list':
+            settings["proxy_lines"] = [ln.strip() for ln in self.proxy_list_txt.get("1.0", "end").strip().splitlines() if ln.strip()]
+            if not settings["proxy_lines"]: messagebox.showerror("Thiếu Proxy", "Bạn đã chọn dùng danh sách proxy nhưng chưa nhập."); return None
+            settings["reset_url_lines"] = [ln.strip() for ln in self.reset_list_txt.get("1.0", "end").strip().splitlines() if ln.strip()]
+            if len(settings["proxy_lines"]) != len(settings["reset_url_lines"]) and settings["reset_url_lines"]:
+                messagebox.showerror("Lỗi số lượng", f"Số lượng proxy ({len(settings['proxy_lines'])}) phải bằng số lượng link reset ({len(settings['reset_url_lines'])})."); return None
+            if self.auto_threads_var.get():
+                settings["n_threads"] = len(settings["proxy_lines"]); self.log_fn(f"INFO: Tự động đặt số luồng = {settings['n_threads']}"); self.threads_var.set(str(settings["n_threads"]))
+        return settings
+    
+    def start_single_job(self, item_id, idx=0):
+        if item_id in self.running_tasks:
+            self.log_fn(f"Tài khoản {self.account_data[item_id]['email']} đã đang chạy."); return
+        settings = self._prepare_run()
+        if not settings: return
+        account = self.account_data[item_id]
+        ep_line = f"{account['email']}|{account['pass']}"
+        proxy_line = ""; reset_url = ""
+        try: current_idx = self.tree.get_children().index(item_id)
+        except ValueError: current_idx = idx
+        if settings["proxy_mode"] != 'none' and settings["proxy_lines"]:
+            proxy_line = settings["proxy_lines"][current_idx % len(settings["proxy_lines"])]
+        if settings["proxy_mode"] != 'none' and settings["reset_url_lines"]:
+            reset_url = settings["reset_url_lines"][current_idx % len(settings["reset_url_lines"])]
+        stop_event = threading.Event()
+        args = (ep_line, proxy_line, settings["ip_check"], settings["win_w"], settings["win_h"], 50, 50, current_idx,
+            reset_url, settings["min_reset_delay"], self.log_fn, False, stop_event,
+            settings["export_ls_enabled"], settings["export_dir"], self.ui_update_q, item_id,
+            self.active_drivers, self.driver_lock)
+        thread = threading.Thread(target=run_flow_single, args=args, daemon=True)
+        self.running_tasks[item_id] = {"thread": thread, "stop_event": stop_event}
+        self.ui_update_q.put(("status", item_id, "Đang chạy...")); self.ui_update_q.put(("action", item_id, "Đóng"))
+        thread.start()
+
+    def _quit_driver_thread(self, driver):
+        try:
+            driver.quit()
+        except Exception as e:
+            self.log_fn(f"Lỗi khi buộc đóng trình duyệt: {e}")
+
+    def stop_single_job(self, item_id, silent=False):
+        task = self.running_tasks.get(item_id)
+        if task:
+            if not silent:
+                self.log_fn(f"Đang gửi yêu cầu dừng cho {self.account_data[item_id]['email']}...")
+            task["stop_event"].set()
+
+            with self.driver_lock:
+                driver_to_quit = self.active_drivers.pop(item_id, None)
+
+            if driver_to_quit:
+                if not silent:
+                    self.log_fn(f"Buộc đóng trình duyệt của {self.account_data[item_id]['email']}.")
+                threading.Thread(target=self._quit_driver_thread, args=(driver_to_quit,), daemon=True).start()
+        
+    def on_start(self, accounts_to_run=None):
+        settings = self._prepare_run()
+        if not settings: return
+        if accounts_to_run is None:
+            accounts_to_run = [item for item in self.tree.get_children() if self.tree.set(item, "status") not in ["Thành công", "Đang chạy...", "Đang chờ...", "Đang mở"]]
+        if not accounts_to_run:
+            messagebox.showinfo("Thông báo", "Không có tài khoản nào hợp lệ để chạy."); return
+        self.stop_event_all = threading.Event()
+        self.start_btn.config(state="disabled"); self.stop_btn.config(state="normal")
+        self.log_box.config(state="normal"); self.log_box.delete("1.0", "end"); self.log_box.config(state="disabled")
+        self.success_log_box.config(state="normal"); self.success_log_box.delete("1.0", "end"); self.success_log_box.config(state="disabled")
+        screen_w = self.winfo_screenwidth()
+        cols = max(1, screen_w // (settings["win_w"] + settings["margin_x"]))
+        self.log_fn(f"== BẮT ĐẦU: {len(accounts_to_run)} tài khoản, {settings['n_threads']} luồng ==")
+
+        def run_pool():
+            try:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=settings["n_threads"]) as ex:
+                    futures = {}
+                    all_items = self.tree.get_children()
+                    for item_id in accounts_to_run:
+                        if self.stop_event_all.is_set(): break
+                        try: idx = all_items.index(item_id)
+                        except ValueError: continue
+                        account = self.account_data[item_id]
+                        ep_line = f"{account['email']}|{account['pass']}"
+                        col, row = idx % cols, idx // cols
+                        pos_x, pos_y = col * (settings["win_w"] + settings["margin_x"]), row * (settings["win_h"] + settings["margin_y"])
+                        proxy_line = ""; reset_url = ""
+                        if settings["proxy_mode"] != 'none' and settings["proxy_lines"]:
+                             proxy_line = settings["proxy_lines"][idx % len(settings["proxy_lines"])]
+                        if settings["proxy_mode"] != 'none' and settings["reset_url_lines"]:
+                             reset_url = settings["reset_url_lines"][idx % len(settings["reset_url_lines"])]
+                        self.ui_update_q.put(("status", item_id, "Đang chờ...")); self.ui_update_q.put(("action", item_id, "Đóng"))
+                        future = ex.submit(run_flow_single, ep_line, proxy_line, settings["ip_check"], settings["win_w"], settings["win_h"], pos_x, pos_y, idx,
+                            reset_url, settings["min_reset_delay"], self.log_fn, settings["headless"], self.stop_event_all,
+                            settings["export_ls_enabled"], settings["export_dir"], self.ui_update_q, item_id,
+                            self.active_drivers, self.driver_lock)
+                        futures[future] = item_id
+                    for future in concurrent.futures.as_completed(futures):
+                        item_id = futures[future]
+                        try: future.result()
+                        except Exception as exc:
+                           self.log_fn(f"Tài khoản {item_id} tạo ra lỗi: {exc}"); self.ui_update_q.put(("status", item_id, "Lỗi Thread"))
+                self.log_fn("✅✅✅ HOÀN THÀNH TẤT CẢ.")
+            finally:
+                self.start_btn.config(state="normal"); self.stop_btn.config(state="disabled")
+        threading.Thread(target=run_pool, daemon=True).start()
+
+    def on_stop(self):
+        if self.stop_event_all:
+            self.log_fn("🛑 Dừng tất cả… Các luồng sẽ kết thúc sau khi hoàn tất phiên hiện tại.")
+            self.stop_event_all.set()
+        
+        # Also iterate and stop all individual running tasks immediately
+        tasks_to_stop = list(self.running_tasks.keys())
+        for item_id in tasks_to_stop:
+            self.stop_single_job(item_id, silent=True) # Silent to avoid spamming logs
+
+        self.stop_btn.config(state="disabled")
+
+if __name__ == "__main__":
+    app = App()
+    app.mainloop()
